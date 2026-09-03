@@ -21,7 +21,7 @@
 
 This fork publishes a clean `baseline` and the current `v1` B390 Vulkan tuning. See [B390-VULKAN-V1.md](B390-VULKAN-V1.md) for the complete optimization list, exact machine snapshot, public benchmark profile, rejected experiments, and upstream references.
 
-The public history is intentionally short: `baseline` is the unmodified upstream snapshot and `v1` is the tuned tree. The public comparison profile is `-ngl -1 -fa auto -b 2048 -ub 512 -t 16 -pg 128,64`; the document also records the separate tuning-window profile used during optimization.
+`baseline` is the unmodified upstream snapshot. `v1` is a merge of the tuned tree with the complete upstream `master` through `c7bda030e`; this includes upstream changes such as PR #27483. The public comparison profile is `-ngl -1 -fa auto -b 2048 -ub 512 -t 16 -pg 128,64`; the document also records the separate tuning-window profile used during optimization.
 
 The exact Release/Vulkan CMake configuration and build command are recorded in [B390-VULKAN-V1.md](B390-VULKAN-V1.md).
 

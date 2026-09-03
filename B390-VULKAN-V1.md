@@ -1,9 +1,9 @@
 # llama.cpp B390 Vulkan tuned fork
 
-This repository contains two published versions:
+This repository contains two published reference points:
 
 - `baseline`: an unmodified upstream llama.cpp tree, based on upstream commit `b81c99b47`.
-- `v1`: the current B390 tuned tree, including the validated local changes described below.
+- `v1`: the B390 tuned tree plus the complete upstream `master` sync described below.
 
 The tuning target is an Intel Arc B390 UMA system running the Qwen3.6 35B-A3B GGUF model through the Vulkan backend. The changes are intentionally hardware and workload gated. They are not a replacement for the generic Vulkan defaults on other devices.
 
@@ -223,10 +223,13 @@ Warm up before measuring. Alternate A and B in the same time window, report the 
 
 ## Version history
 
-The public history is intentionally reduced to two commits:
+The named release points are:
 
 1. `baseline`: the unmodified upstream tree at `b81c99b47`.
-2. `v1`: the complete tuned tree described in this document.
+2. the pre-sync tuned v1 tree, preserved locally as `v1-before-upstream-merge` at `a57f8a594`.
+3. `v1`: merge commit `aaffe04f5`, with the pre-sync tuned tree as its first parent and upstream `master` commit `c7bda030e` as its second parent.
+
+The v1 merge therefore includes all upstream commits through `c7bda030e`, including the upstream merge of [PR #27483](https://github.com/ggml-org/llama.cpp/pull/27483). The B390 changes remain in the first-parent side of the merge. The old exploratory chain is not pushed as the public default history.
 
 The original local development chain contained many exploratory commits. Their subjects are preserved here for traceability, but the exploratory chain is not part of the public history:
 
@@ -262,6 +265,7 @@ These upstream PRs were used as design references or comparison points. A refere
 - [PR #27621](https://github.com/ggml-org/llama.cpp/pull/27621) - extending MoE fusion to speculative decoding.
 - [PR #27909](https://github.com/ggml-org/llama.cpp/pull/27909) - mat-vec row tuning for batched inference.
 - [PR #27925](https://github.com/ggml-org/llama.cpp/pull/27925) - `mul_mat_id` K/N padding direction.
+- [PR #27483](https://github.com/ggml-org/llama.cpp/pull/27483) - upstream model-loading peak-RAM reduction; included through the full upstream sync in v1.
 
 ## Scope and maintenance
 
