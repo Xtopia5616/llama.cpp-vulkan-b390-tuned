@@ -113,7 +113,11 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
+#ifdef B390_TUNED
+    [[dont_unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size)
+#else
     [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size)
+#endif
         calc_superblock(a_offset, b_offset, v_im, q_offset, y_offset, i, num_blocks_per_row, first_row, num_rows);
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);

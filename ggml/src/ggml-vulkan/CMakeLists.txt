@@ -66,6 +66,124 @@ if (Vulkan_FOUND)
 
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
 
+    set(B390_TUNED OFF)
+
+    if (GGML_VULKAN_B390_TUNED)
+        # This build is intentionally specialized for the local Intel Arc B390
+        # and the IQ3_XXS model used by the deployment scripts.  Keep the
+        # default OFF so generic Vulkan builds retain runtime portability.
+        add_compile_definitions(GGML_VULKAN_B390_TUNED)
+        set(B390_TUNED ON)
+    endif()
+
+    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_B390_TUNED=${B390_TUNED})
+
+    if (GGML_VULKAN_B390_TUNED)
+        # The shader generator is a separate ExternalProject. Forward both ON
+        # and OFF explicitly so a reused build tree cannot retain a stale
+        # candidate define from a previous experiment.
+        set(B390_GEMM_CACHE_SCOPE OFF)
+        if (GGML_VULKAN_B390_GEMM_CACHE_SCOPE)
+            # The shader-side guard further limits this candidate to the fixed
+            # model's Q4_K/Q5_K cooperative-matrix variants.
+            add_compile_definitions(GGML_VULKAN_B390_GEMM_CACHE_SCOPE)
+            set(B390_GEMM_CACHE_SCOPE ON)
+        endif()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_B390_GEMM_CACHE_SCOPE=${B390_GEMM_CACHE_SCOPE})
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED AND GGML_VULKAN_B390_SLM_A_RESHAPE)
+        # Keep the B390 SLM-A layout choice independently switchable. When the
+        # option is OFF, ggml-vulkan.cpp deliberately sends the unreshaped
+        # layout spec constant, without changing generic Vulkan builds.
+        add_compile_definitions(GGML_VULKAN_B390_SLM_A_RESHAPE)
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED AND GGML_VULKAN_B390_SHAPE_AWARE_SUBMIT)
+        # Make the B390 prefill/decode submit policy independently switchable.
+        # The implementation keeps an explicit GGML_VK_B390_FLOPS_DIVISOR
+        # override, so this candidate is safe to disable or to override at
+        # runtime without changing generic Vulkan behavior.
+        add_compile_definitions(GGML_VULKAN_B390_SHAPE_AWARE_SUBMIT)
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED)
+        set(B390_Q4_BITFIELD_DEQUANT OFF)
+        set(B390_Q5_BITFIELD_DEQUANT OFF)
+        if (GGML_VULKAN_B390_Q4_ONLY_BITFIELD_DEQUANT OR GGML_VULKAN_B390_Q4Q5_BITFIELD_DEQUANT)
+            # The Q4-only result is the retained B390 path. Keep the legacy
+            # Q4/Q5 option as a compatibility alias, but never enable the
+            # slower Q5_K bitfield shader again.
+            add_compile_definitions(GGML_VULKAN_B390_Q4_BITFIELD_DEQUANT)
+            set(B390_Q4_BITFIELD_DEQUANT ON)
+        endif()
+        if (GGML_VULKAN_B390_Q5_ONLY_BITFIELD_DEQUANT)
+            # Keep the Q5_K follow-up independently selectable. It is an
+            # experiment only and must not silently change the Q4 default.
+            add_compile_definitions(GGML_VULKAN_B390_Q5_BITFIELD_DEQUANT)
+            set(B390_Q5_BITFIELD_DEQUANT ON)
+        endif()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS
+            -DGGML_VULKAN_B390_Q4_BITFIELD_DEQUANT=${B390_Q4_BITFIELD_DEQUANT}
+            -DGGML_VULKAN_B390_Q5_BITFIELD_DEQUANT=${B390_Q5_BITFIELD_DEQUANT})
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED)
+        set(B390_ROUTE_COUNT_WG128 OFF)
+        if (GGML_VULKAN_B390_ROUTE_COUNT_WG128)
+            # The route-count shader is the prefill-only half of the b593 route
+            # packing path. Keep its workgroup size independently switchable so
+            # the route-packing throughput signal can be tested without changing
+            # the packed-row layout or the generic Vulkan path.
+            add_compile_definitions(GGML_VULKAN_B390_ROUTE_COUNT_WG128)
+            set(B390_ROUTE_COUNT_WG128 ON)
+        endif()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_B390_ROUTE_COUNT_WG128=${B390_ROUTE_COUNT_WG128})
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED AND GGML_VULKAN_B390_ROUTE_CACHE_DATA_KEY)
+        # The cache is valid only for one graph evaluation. Keying by the
+        # routed ID data lets equivalent tensor wrappers share packed rows
+        # while retaining all shape/stride/view checks below.
+        add_compile_definitions(GGML_VULKAN_B390_ROUTE_CACHE_DATA_KEY)
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED)
+        set(B390_ROUTE_HISTOGRAM_SCAN OFF)
+        if (GGML_VULKAN_B390_ROUTE_HISTOGRAM_SCAN AND NOT GGML_VULKAN_B390_ROUTE_SINGLE_SCAN)
+            # Keep the histogram candidate independent from the single-scan
+            # experiment. It uses two dispatches so the histogram and the
+            # final route-row writes cannot race across workgroups.
+            add_compile_definitions(GGML_VULKAN_B390_ROUTE_HISTOGRAM_SCAN)
+            set(B390_ROUTE_HISTOGRAM_SCAN ON)
+        endif()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_B390_ROUTE_HISTOGRAM_SCAN=${B390_ROUTE_HISTOGRAM_SCAN})
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED)
+        set(B390_ROUTE_SINGLE_SCAN OFF)
+        if (GGML_VULKAN_B390_ROUTE_SINGLE_SCAN AND NOT GGML_VULKAN_B390_ROUTE_HISTOGRAM_SCAN)
+            # The single-scan shader changes only the route-count implementation;
+            # its output layout and the subsequent MUL_MAT_ID path remain intact.
+            add_compile_definitions(GGML_VULKAN_B390_ROUTE_SINGLE_SCAN)
+            set(B390_ROUTE_SINGLE_SCAN ON)
+        endif()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_B390_ROUTE_SINGLE_SCAN=${B390_ROUTE_SINGLE_SCAN})
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED AND GGML_VULKAN_B390_ROUTE_INDIRECT)
+        # The candidate changes only MUL_MAT_ID matrix shader interfaces and
+        # keeps the existing vector-ID path on the normal dispatch route.
+        add_compile_definitions(GGML_VULKAN_B390_ROUTE_INDIRECT)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_B390_ROUTE_INDIRECT=ON)
+    else()
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_B390_ROUTE_INDIRECT=OFF)
+    endif()
+
+    if (GGML_VULKAN_B390_TUNED AND GGML_VULKAN_B390_GRAPH_REPLAY)
+        add_compile_definitions(GGML_VULKAN_B390_GRAPH_REPLAY)
+    endif()
+
     # Test all shader extensions
     test_shader_extension_support(
         "GL_KHR_cooperative_matrix"

@@ -1570,19 +1570,9 @@ const uint32_t iq3xxs_grid_const[256] = {
     0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
 };
 
-shared uint32_t iq3xxs_grid[256];
-
-#define NEEDS_INIT_IQ_SHMEM
-void init_iq_shmem(uvec3 wgsize)
-{
-    // copy the table into shared memory and sync
-    [[unroll]] for (uint i = 0; i < iq3xxs_grid.length(); i += wgsize.x) {
-        if (iq3xxs_grid.length() % wgsize.x == 0 || i + gl_LocalInvocationIndex.x < iq3xxs_grid.length()) {
-            iq3xxs_grid[i + gl_LocalInvocationIndex.x] = iq3xxs_grid_const[i + gl_LocalInvocationIndex.x];
-        }
-    }
-    barrier();
-}
+// IQ3_XXS uses this table on every decode lane. Keep it in constant storage
+// so the B390 path avoids a workgroup-wide copy and barrier on each dispatch.
+#define iq3xxs_grid iq3xxs_grid_const
 
 #define QUANT_K QUANT_K_IQ3_XXS
 #define QUANT_R QUANT_R_IQ3_XXS

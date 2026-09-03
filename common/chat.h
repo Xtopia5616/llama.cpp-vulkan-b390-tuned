@@ -166,17 +166,29 @@ struct common_chat_msg_span {
 struct common_chat_msg_spans {
     std::vector<common_chat_msg_span> spans;
 
+    bool is_role_start(int32_t pos, common_chat_role role) const {
+        for (const auto & span : spans) {
+            if (span.role == role && pos == (int32_t) span.pos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void add(common_chat_role role, size_t pos, size_t len) {
         spans.push_back({ role, pos, len });
     }
 
     bool is_user_start(int32_t pos) const {
-        for (auto it = spans.begin(); it != spans.end(); ++it) {
-            if (it->role == COMMON_CHAT_ROLE_USER && pos == (int32_t) it->pos) {
-                return true;
-            }
-        }
-        return false;
+        return is_role_start(pos, COMMON_CHAT_ROLE_USER);
+    }
+
+    // Semantic anchors are useful before new user/tool content is appended.
+    // They are deliberately narrower than every role transition to avoid
+    // turning normal assistant formatting into a checkpoint boundary.
+    bool is_semantic_start(int32_t pos) const {
+        return is_role_start(pos, COMMON_CHAT_ROLE_USER)
+            || is_role_start(pos, COMMON_CHAT_ROLE_TOOL);
     }
 
     int32_t last_user_message_pos() const {

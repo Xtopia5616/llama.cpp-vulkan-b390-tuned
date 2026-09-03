@@ -1,6 +1,7 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
 #ifdef USE_SUBGROUPS
 #extension GL_KHR_shader_subgroup_basic : enable
@@ -17,95 +18,223 @@ layout (push_constant) uniform parameter
     uint32_t nb00;
     uint32_t nb01;
     uint32_t a_offset;
-    uint32_t n_experts;
-    uint32_t hoist_row_ids;
+    // These two slots are n_as/stage for B390 and the expert count/flag for
+    // the upstream hoisted-row path.
+    uint32_t n_as;
+    uint32_t stage;
     uint32_t ne00mp;
     uint32_t ne00L;
 } p;
 
+#ifdef B390_TUNED
+
+#ifdef B390_ROUTE_HISTOGRAM_SCAN
 #define BLOCK_SIZE 256
+#elif defined(B390_ROUTE_COUNT_WG128)
+#define BLOCK_SIZE 128
+#else
+#define BLOCK_SIZE 256
+#endif
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+layout (binding = 0) readonly buffer A {uint data_a[];};
+#if defined(B390_ROUTE_SINGLE_SCAN) || defined(B390_ROUTE_HISTOGRAM_SCAN)
+layout (binding = 1) buffer D {uint data_d[];};
+#else
+layout (binding = 1) writeonly buffer D {uint data_d[];};
+#endif
+#ifdef B390_ROUTE_HISTOGRAM_SCAN
+layout (binding = 2) buffer RouteWorkspace {uint data_route[];};
+#else
+layout (binding = 2) writeonly buffer RouteRows {u16vec2 data_route[];};
+#endif
 
+#ifdef B390_ROUTE_HISTOGRAM_SCAN
+shared uint local_counts[BLOCK_SIZE];
+shared uint base_offsets[BLOCK_SIZE];
+shared uint default_count[BLOCK_SIZE];
+
+void main() {
+    const uint num_elements = p.ne00 * p.ne01;
+    const uint num_blocks = (num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const uint block_id = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (p.stage == 2) {
+        const uint expert_id = block_id;
+        if (tid == 0) default_count[0] = 0;
+        barrier();
+        for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+            const uint i01 = idx / p.ne00;
+            const uint i00 = idx % p.ne00;
+            const uint a = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
+            if (a == expert_id) {
+                const uint route_idx = atomicAdd(default_count[0], 1);
+                data_route[expert_id * num_elements + route_idx] =
+                    (i00 & 0xffffu) | ((i01 & 0xffffu) << 16);
+            }
+        }
+        barrier();
+        if (tid == 0) data_d[expert_id] = default_count[0];
+        return;
+    }
+
+    if (p.stage == 0) {
+        for (uint expert_id = tid; expert_id < p.n_as; expert_id += BLOCK_SIZE) {
+            local_counts[expert_id] = 0;
+        }
+        barrier();
+        const uint block_begin = block_id * BLOCK_SIZE;
+        const uint block_end = min(block_begin + BLOCK_SIZE, num_elements);
+        for (uint idx = block_begin + tid; idx < block_end; idx += BLOCK_SIZE) {
+            const uint i01 = idx / p.ne00;
+            const uint i00 = idx % p.ne00;
+            const uint expert_id = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
+            if (expert_id < p.n_as) {
+                const uint local_rank = atomicAdd(local_counts[expert_id], 1);
+                data_route[num_blocks * p.n_as + idx] = expert_id | (local_rank << 16);
+            } else {
+                data_route[num_blocks * p.n_as + idx] = 0xffffffffu;
+            }
+        }
+        barrier();
+        for (uint expert_id = tid; expert_id < p.n_as; expert_id += BLOCK_SIZE) {
+            data_route[block_id * p.n_as + expert_id] = local_counts[expert_id];
+        }
+        return;
+    }
+
+    for (uint expert_id = tid; expert_id < p.n_as; expert_id += BLOCK_SIZE) {
+        uint prefix = 0;
+        for (uint b = 0; b < block_id; ++b) prefix += data_route[b * p.n_as + expert_id];
+        base_offsets[expert_id] = prefix;
+        if (block_id == 0) {
+            uint total = 0;
+            for (uint b = 0; b < num_blocks; ++b) total += data_route[b * p.n_as + expert_id];
+            data_d[expert_id] = total;
+        }
+    }
+    barrier();
+    const uint block_begin = block_id * BLOCK_SIZE;
+    const uint block_end = min(block_begin + BLOCK_SIZE, num_elements);
+    for (uint idx = block_begin + tid; idx < block_end; idx += BLOCK_SIZE) {
+        const uint packed = data_route[num_blocks * p.n_as + idx];
+        const uint expert_id = packed & 0xffffu;
+        const uint route_idx = packed >> 16;
+        if (expert_id < p.n_as) {
+            const uint row_base = num_blocks * p.n_as + num_elements + expert_id * num_elements;
+            const uint i01 = idx / p.ne00;
+            const uint i00 = idx % p.ne00;
+            data_route[row_base + base_offsets[expert_id] + route_idx] =
+                (i00 & 0xffffu) | ((i01 & 0xffffu) << 16);
+        }
+    }
+}
+#elif defined(B390_ROUTE_SINGLE_SCAN)
+void main() {
+    const uint num_elements = p.ne00 * p.ne01;
+    const uint tid = gl_LocalInvocationID.x;
+    for (uint expert_id = tid; expert_id < p.n_as; expert_id += BLOCK_SIZE) data_d[expert_id] = 0;
+    memoryBarrierBuffer();
+    barrier();
+    for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+        const uint i01 = idx / p.ne00;
+        const uint i00 = idx % p.ne00;
+        const uint expert_id = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
+        if (expert_id < p.n_as) {
+            const uint route_idx = atomicAdd(data_d[expert_id], 1);
+            data_route[expert_id * num_elements + route_idx] = u16vec2(i00, i01);
+        }
+    }
+}
+#else
+shared uint vals[BLOCK_SIZE];
+void main() {
+    const uint expert_id = gl_WorkGroupID.x;
+    const uint num_elements = p.ne00 * p.ne01;
+    const uint tid = gl_LocalInvocationID.x;
+    if (tid == 0) vals[0] = 0;
+    barrier();
+    for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+        const uint i01 = idx / p.ne00;
+        const uint i00 = idx % p.ne00;
+        const uint a = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
+        if (a == expert_id) {
+            const uint route_idx = atomicAdd(vals[0], 1);
+            data_route[expert_id * num_elements + route_idx] = u16vec2(i00, i01);
+        }
+    }
+    barrier();
+    if (tid == 0) data_d[expert_id] = vals[0];
+}
+#endif
+
+#else
+
+#define BLOCK_SIZE 256
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 layout (binding = 0) readonly buffer A {uint data_a[];};
 layout (binding = 1) writeonly buffer D {uint data_d[];};
-
 shared uint vals[BLOCK_SIZE];
 shared uint offsets[BLOCK_SIZE];
 shared uint cursors[BLOCK_SIZE];
 
-// data_d layout when p.hoist_row_ids is set:
-//   [0,              n_experts)   per-expert row count
-//   [n_experts,    2*n_experts)   per-expert start offset into the row id region
-//   [2*n_experts]                 total row count
-//   [2*n_experts + 1,         )   row ids grouped by expert, packed as (i01 << 16) | (i00 & 0xffff)
-// Otherwise only data_d[expert_id] is written, holding that expert's row count.
 void main() {
     const uint expert_id = gl_WorkGroupID.x;
     const uint num_elements = p.ne00 * p.ne01;
     const uint tid = gl_LocalInvocationID.x;
 
-    if (p.hoist_row_ids != 0) {
-        if (tid < p.n_experts) {
-            vals[tid] = 0;
-        }
+    if (p.stage != 0) {
+        if (tid < p.n_as) vals[tid] = 0;
         barrier();
-
         for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
             const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
             const uint i00 = idx - i01 * p.ne00;
             const uint expert = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
-            if (expert < p.n_experts) {
-                atomicAdd(vals[expert], 1);
-            }
+            if (expert < p.n_as) atomicAdd(vals[expert], 1);
         }
         barrier();
-
 #ifdef USE_SUBGROUPS
         if (gl_SubgroupID == 0) {
-            // pad the trip count so the subgroup ops stay in uniform control flow
-            const uint n_experts_padded = (p.n_experts + gl_SubgroupSize - 1) & ~(gl_SubgroupSize - 1);
+            const uint n_experts_padded = (p.n_as + gl_SubgroupSize - 1) & ~(gl_SubgroupSize - 1);
             uint base = 0;
             for (uint expert = gl_SubgroupInvocationID; expert < n_experts_padded; expert += gl_SubgroupSize) {
-                const bool in_range = expert < p.n_experts;
+                const bool in_range = expert < p.n_as;
                 const uint count = in_range ? vals[expert] : 0;
                 const uint offset = base + subgroupExclusiveAdd(count);
                 if (in_range) {
                     data_d[expert] = count;
-                    data_d[p.n_experts + expert] = offset;
+                    data_d[p.n_as + expert] = offset;
                     offsets[expert] = offset;
                     cursors[expert] = 0;
                 }
                 base += subgroupAdd(count);
             }
-            if (subgroupElect()) {
-                data_d[2 * p.n_experts] = base;
-            }
+            if (subgroupElect()) data_d[2 * p.n_as] = base;
         }
 #else
         if (tid == 0) {
             uint offset = 0;
-            for (uint expert = 0; expert < p.n_experts; ++expert) {
+            for (uint expert = 0; expert < p.n_as; ++expert) {
                 const uint count = vals[expert];
                 data_d[expert] = count;
-                data_d[p.n_experts + expert] = offset;
+                data_d[p.n_as + expert] = offset;
                 offsets[expert] = offset;
                 cursors[expert] = 0;
                 offset += count;
             }
-            data_d[2 * p.n_experts] = offset;
+            data_d[2 * p.n_as] = offset;
         }
 #endif
         barrier();
-
         for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
             const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
             const uint i00 = idx - i01 * p.ne00;
             const uint expert = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
-            if (expert < p.n_experts) {
+            if (expert < p.n_as) {
                 const uint row = atomicAdd(cursors[expert], 1);
                 const uint packed_row_id = (i01 << 16) | (i00 & 0xffffu);
-                data_d[2 * p.n_experts + 1 + offsets[expert] + row] = packed_row_id;
+                data_d[2 * p.n_as + 1 + offsets[expert] + row] = packed_row_id;
             }
         }
         return;
@@ -116,20 +245,15 @@ void main() {
         const uint i01 = fastdiv(idx, p.ne00mp, p.ne00L);
         const uint i00 = idx - i01 * p.ne00;
         const uint a = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
-
         count += uint(a == expert_id);
     }
-
     vals[tid] = count;
     barrier();
     [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] += vals[tid + s];
-        }
+        if (tid < s) vals[tid] += vals[tid + s];
         barrier();
     }
-
-    if (tid == 0) {
-        data_d[expert_id] = vals[0];
-    }
+    if (tid == 0) data_d[expert_id] = vals[0];
 }
+
+#endif

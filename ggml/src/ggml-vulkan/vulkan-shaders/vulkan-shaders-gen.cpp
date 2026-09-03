@@ -455,6 +455,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     std::map<std::string, std::string> base_dict;
     std::string shader_name = "matmul";
 
+#ifdef GGML_VULKAN_B390_TUNED
+    base_dict["B390_TUNED"] = "1";
+#endif
+
     if (matmul_id_type == MatMulIdType::DEFAULT) {
         base_dict["MUL_MAT_ID"] = "1";
         shader_name = "matmul_id";
@@ -486,6 +490,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     if (dot2) {
         base_dict["DOT2_F16"] = "1";
     }
+
+#ifdef GGML_VULKAN_B390_ROUTE_INDIRECT
+    if (matmul_id_type != MatMulIdType::NONE) {
+        base_dict["B390_ROUTE_INDIRECT"] = "1";
+    }
+#endif
 
     const std::string source_name = coopmat2 ? "mul_mm_cm2.comp" : "mul_mm.comp";
 
@@ -585,8 +595,14 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         std::string load_vec_quant = "2";
         if ((tname == "q1_0") || (tname == "q4_0") || (tname == "q4_1") || (tname == "q5_1") || (tname == "iq1_s") || (tname == "iq1_m") || (tname == "iq2_xxs") || (tname == "iq2_xs") || (tname == "iq2_s"))
             load_vec_quant = "8";
-        else if ((tname == "q2_0") || (tname == "q5_0") || (tname == "q8_0") || (tname == "q2_k") || (tname == "q4_k") || (tname == "q5_k") || (tname == "iq3_xxs") || (tname == "iq3_s") || (tname == "iq4_xs") || (tname == "iq4_nl") || (tname == "mxfp4") || (tname == "nvfp4"))
+        else if ((tname == "q2_0") || (tname == "q5_0") || (tname == "q8_0") || (tname == "q2_k") || (tname == "q4_k") || (tname == "q5_k") || (tname == "iq3_s") || (tname == "iq4_xs") || (tname == "iq4_nl") || (tname == "mxfp4") || (tname == "nvfp4"))
             load_vec_quant = "4";
+
+        // IQ3_XXS can consume two adjacent 4-value codes per aligned A load.
+        // Keep this isolated from the other quantized formats: its packed
+        // sign/scale layout is the only one covered by the paired decoder.
+        else if (tname == "iq3_xxs")
+            load_vec_quant = "8";
 
         if (tname == "bf16") {
             continue;
@@ -603,13 +619,38 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             {"FLOAT_TYPEV8", FLOAT_TYPE(8, tname)},
         };
 
+        std::map<std::string, std::string> type_dict = {
+            {data_a_key, "1"},
+        };
+#if defined(GGML_VULKAN_B390_GEMM_CACHE_SCOPE)
+        // Keep the candidate out of unrelated quantization formats in the
+        // same binary. These are the quantized GEMM families actually
+        // selected by the fixed Qwen3.6 IQ3_XXS model on B390.
+        if (tname == "q4_k" || tname == "q5_k") {
+            type_dict["B390_GEMM_CACHE_SCOPE"] = "1";
+        }
+#endif
+#if defined(GGML_VULKAN_B390_Q4_BITFIELD_DEQUANT)
+        // Q4_K accounts for most observed quantized GEMM selector activity;
+        // keep Q5_K on the baseline decode path.
+        if (tname == "q4_k") {
+            type_dict["B390_Q4_BITFIELD_DEQUANT"] = "1";
+        }
+#endif
+#if defined(GGML_VULKAN_B390_Q5_BITFIELD_DEQUANT)
+        // Keep the Q5_K follow-up isolated from the retained Q4_K path.
+        if (tname == "q5_k") {
+            type_dict["B390_Q5_BITFIELD_DEQUANT"] = "1";
+        }
+#endif
+
         // don't generate f32 variants for coopmat2
         if (!coopmat2) {
-            string_to_spv(shader_name + "_" + tname + "_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, float_type_dict), merge_maps(type_dict, {{"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}})), fp16, coopmat, coopmat2, f16acc);
         }
 
         if (tname != "f16" && tname != "f32") {
-            string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name,  merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f16" + dot2_sfx, source_name,  merge_maps(merge_maps(base_dict, float_type_dict), merge_maps(type_dict, {{"LOAD_VEC_A", load_vec_a}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"B_TYPE_SCALAR", "float16_t"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}})), fp16, coopmat, coopmat2, f16acc);
         }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
@@ -877,6 +918,14 @@ void process_shaders() {
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
+    string_to_spv("fa_hdim_64", "flash_attn_hdim64.comp", {}, true, true, false, false);
+    string_to_spv("fa_hdim_96", "flash_attn_hdim96.comp", {}, true, true, false, false);
+    string_to_spv("fa_hdim_128", "flash_attn_hdim128.comp", {}, true, true, false, false);
+    string_to_spv("fa_decode_ph1", "flash_attn_decode_phase_1.comp", {}, true, true, false, false);
+    string_to_spv("fa_decode_ph2", "flash_attn_decode_phase_2.comp", {}, true, true, false, false);
+    string_to_spv("fa_prefill_ph1", "flash_attn_prefill_phase_1.comp", {}, true, true, false, false);
+    string_to_spv("fa_prefill_ph2", "flash_attn_prefill_phase_2.comp", {}, true, true, false, false);
+
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
 
@@ -1041,8 +1090,24 @@ void process_shaders() {
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
-    string_to_spv("count_experts", "count_experts.comp", merge_maps(base_dict, {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}}));
-    string_to_spv("count_experts_subgroup", "count_experts.comp", merge_maps(base_dict, {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"USE_SUBGROUPS", "1"}}));
+    auto count_experts_dict = merge_maps(base_dict, {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+#ifdef GGML_VULKAN_B390_TUNED
+    count_experts_dict["B390_TUNED"] = "1";
+#endif
+#ifdef GGML_VULKAN_B390_ROUTE_COUNT_WG128
+    count_experts_dict["B390_ROUTE_COUNT_WG128"] = "1";
+#endif
+#ifdef GGML_VULKAN_B390_ROUTE_SINGLE_SCAN
+    count_experts_dict["B390_ROUTE_SINGLE_SCAN"] = "1";
+#endif
+#ifdef GGML_VULKAN_B390_ROUTE_HISTOGRAM_SCAN
+    count_experts_dict["B390_ROUTE_HISTOGRAM_SCAN"] = "1";
+#endif
+    string_to_spv("count_experts", "count_experts.comp", count_experts_dict);
+    string_to_spv("count_experts_subgroup", "count_experts.comp", merge_maps(count_experts_dict, {{"USE_SUBGROUPS", "1"}}));
+#ifdef GGML_VULKAN_B390_ROUTE_INDIRECT
+    string_to_spv("compact_experts", "compact_experts.comp", {});
+#endif
 
     for (std::string dim_str : {"", "_3d"}) {
         for (bool bda : {false, true}) {
@@ -1160,6 +1225,8 @@ void process_shaders() {
     string_to_spv("ssm_scan_subgroup_f32", "ssm_scan.comp", {{"A_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
+    string_to_spv("ssm_conv_state_f32", "ssm_conv.comp", {{"A_TYPE", "float"}, {"FUSE_STATE", "1"}});
+    string_to_spv("ssm_conv_state_silu_f32", "ssm_conv.comp", {{"A_TYPE", "float"}, {"FUSE_STATE", "1"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 

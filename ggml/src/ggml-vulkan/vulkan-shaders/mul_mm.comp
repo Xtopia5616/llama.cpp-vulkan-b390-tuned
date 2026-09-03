@@ -66,8 +66,15 @@ layout (binding = 1) readonly buffer B_SCALAR {B_TYPE_SCALAR data_b_scalar[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #ifdef MUL_MAT_ID
+#if defined(B390_TUNED)
+layout (binding = 3) readonly buffer RouteRows {u16vec2 data_route[];};
+#else
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
+#endif
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+#ifdef B390_ROUTE_INDIRECT
+layout (binding = 5) readonly buffer ActiveExperts {uint data_active_experts[];};
+#endif
 #endif
 
 layout (push_constant) uniform parameter
@@ -90,6 +97,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint hoist_row_ids;
+    uint padded_N;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -145,7 +153,11 @@ void main() {
     const uint ic = gl_WorkGroupID.y;
 
 #ifdef MUL_MAT_ID
+#ifdef B390_ROUTE_INDIRECT
+    const uint expert_idx = data_active_experts[1 + gl_WorkGroupID.z];
+#else
     const uint expert_idx = gl_WorkGroupID.z;
+#endif
     if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }
@@ -170,9 +182,14 @@ void main() {
     const uint ir = gl_WorkGroupID.x % blocks_m;
     const uint ik = gl_WorkGroupID.x / blocks_m;
 
+#ifndef COOPMAT
+    // These values are only used by the scalar/subgroup path below. The
+    // cooperative-matrix path has its own TM/TN tile decomposition and valid
+    // coopmat tiles can otherwise form a zero WNITER and undefined WSUBN.
     const uint WNITER = (WM * WN) / (WARP * TM * TN * WMITER);
     const uint WSUBM = WM / WMITER;
     const uint WSUBN = WN / WNITER;
+#endif
 
 #ifdef COOPMAT
     const uint warp_i = gl_SubgroupID;
@@ -216,6 +233,9 @@ void main() {
     const uint loadstride_b = gl_WorkGroupSize.x * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK;
 
 #ifdef MUL_MAT_ID
+#if defined(B390_TUNED)
+    load_row_ids(expert_idx, ic);
+#else
     if (p.hoist_row_ids != 0) {
         load_row_ids_hoisted(expert_idx, ic);
     } else {
@@ -241,9 +261,13 @@ void main() {
         barrier();
 #endif
     }
+#endif
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;
+
+    uint required_work_items = (_ne1 - ic * BN) * BK / LOAD_VEC_B_EFF / LOAD_VEC_BATCH_B;
+    uint required_warp_c = (_ne1 - ic * BN + WN - 1) / WN;
 #endif
 
 #ifdef MUL_MAT_ID
@@ -268,8 +292,15 @@ void main() {
 #endif
 
 #ifdef COOPMAT
+#ifndef B390_GEMM_CACHE_SCOPE
     coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a;
     coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
+#else
+#if !defined(DATA_A_Q4_K) && !defined(DATA_A_Q5_K)
+    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a;
+    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
+#endif
+#endif
     coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[cms_per_row * cms_per_col];
 
     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col; i++) {
@@ -294,6 +325,9 @@ void main() {
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
+        #ifdef MUL_MAT_ID
+        if (gl_LocalInvocationID.x < required_work_items) {
+        #endif
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
 #if !defined(MUL_MAT_ID)
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
@@ -301,6 +335,9 @@ void main() {
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
 #endif
         }
+        #ifdef MUL_MAT_ID
+        }
+        #endif
 
         barrier();
 
@@ -308,7 +345,37 @@ void main() {
         pos_b += BK / LOAD_VEC_B_EFF;
 
 #ifdef COOPMAT
+#ifdef MUL_MAT_ID
+        if (warp_c < required_warp_c) {
+#endif
         [[unroll]] for (uint i = 0; i < BK; i += TK) {
+#if defined(B390_GEMM_CACHE_SCOPE) && (defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+            // Keep the cooperative-matrix inputs scoped to one K tile and
+            // load each A row/B column once before the Cartesian multiply.
+            // PR24407 uses this layout to shorten cache lifetimes and avoid
+            // reloading the same cooperative matrix for every output tile.
+            // IQ3_XXS itself did not select a cooperative-matrix GEMM in the
+            // telemetry probe, so it is deliberately not changed here.
+            coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a[cms_per_row];
+            coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b[cms_per_col];
+            [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+                coopMatLoad(cache_a[cm_row], buf_a,
+                    a_shmem_index(warp_r * WM + cm_row * TM, i / 2),
+                    a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                coopMatLoad(cache_b[cm_col], buf_b,
+                    (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2,
+                    SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(
+                        cache_a[cm_row], cache_b[cm_col],
+                        sums[cm_col * cms_per_row + cm_row]);
+                }
+            }
+#else
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 // Load from shared into cache
                 coopMatLoad(cache_a, buf_a, a_shmem_index(warp_r * WM + cm_row * TM, i / 2), a_shmem_stride(), gl_CooperativeMatrixLayoutRowMajor);
@@ -319,7 +386,11 @@ void main() {
                     sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
                 }
             }
+#endif
         }
+#ifdef MUL_MAT_ID
+        }
+#endif
 #else
         [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
             // Load from shared into cache

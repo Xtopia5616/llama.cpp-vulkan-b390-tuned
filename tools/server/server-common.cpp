@@ -77,6 +77,9 @@ json server_slot_stats::to_json() const {
         {"predicted_ms",           t_gen_ms()},
         {"predicted_per_token_ms", t_gen_per_token_ms()},
         {"predicted_per_second",   n_gen_tps()},
+
+        {"checkpoint_hits",        n_checkpoint_hits},
+        {"checkpoint_tokens",      n_checkpoint_tokens},
     };
 
     if (n_draft_tokens > 0) {

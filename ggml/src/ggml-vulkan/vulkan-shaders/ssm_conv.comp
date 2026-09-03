@@ -15,12 +15,18 @@ layout(binding = 0) readonly buffer Src0 { float src0[]; };
 layout(binding = 1) readonly buffer Src1 { float src1[]; };
 layout(binding = 2) readonly buffer Bias { float bias[]; };
 layout(binding = 3) buffer Dst { float dst[]; };
+#ifdef FUSE_STATE
+layout(binding = 4) buffer State { float state[]; };
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint nb01; uint nb02;
     uint nb11;
     uint dst_nb0; uint dst_nb1; uint dst_nb2;
     uint nc; uint ncs; uint nr; uint n_t; uint n_s;
+#ifdef FUSE_STATE
+    uint state_ne0; uint state_nb1; uint state_src_start; uint state_enabled;
+#endif
 };
 
 void main() {
@@ -57,4 +63,16 @@ void main() {
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
     dst[dst_idx] = sum;
+
+#ifdef FUSE_STATE
+    // The state CPY is fused into the convolution dispatch.  All input values
+    // for this channel/token are consumed before the write, so the overlap
+    // between the old state prefix and the new state window is race-free.
+    if (state_enabled != 0u && i2 == 0u) {
+        [[unroll]] for (uint tap = 0u; tap < state_ne0; ++tap) {
+            const uint state_idx = i3 * state_nb1 + i1 * state_ne0 + tap;
+            state[state_idx] = src0[src0_base + state_src_start + tap];
+        }
+    }
+#endif
 }

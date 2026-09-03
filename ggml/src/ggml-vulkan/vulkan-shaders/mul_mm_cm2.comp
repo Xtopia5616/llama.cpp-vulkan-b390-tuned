@@ -58,6 +58,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint hoist_row_ids;
+    uint padded_N;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -104,8 +105,15 @@ layout (binding = 1) readonly buffer B4 {B_TYPEV4 data_b_v4[];};
 #endif
 
 #ifdef MUL_MAT_ID
+#if defined(B390_TUNED)
+layout (binding = 3) readonly buffer RouteRows {u16vec2 data_route[];};
+#else
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
+#endif
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+#ifdef B390_ROUTE_INDIRECT
+layout (binding = 5) readonly buffer ActiveExperts {uint data_active_experts[];};
+#endif
 
 shared u16vec4 row_ids[BN];
 
@@ -115,7 +123,6 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufB {
 
 uint _ne1;
 layout (constant_id = 6) const uint subgroup_size = 32;
-shared uvec4 ballots_sh[BLOCK_SIZE / subgroup_size];
 
 B_TYPE decodeFuncB(const in decodeBufB bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
@@ -162,68 +169,15 @@ D_TYPE perElemOpD(const in uint32_t r, const in uint32_t c, const in D_TYPE elem
     return elem;
 }
 
-void load_row_ids(uint expert_idx, bool nei0_is_pow2, uint ic) {
-    _ne1 = 0;
-    uint num_elements = p.nei1 * p.nei0;
-    uint nei0shift = findLSB(p.nei0);
+void load_row_ids(uint expert_idx, uint ic) {
+    _ne1 = data_expert_count[expert_idx];
+    const uint row_start = ic * BN;
+    const uint row_count = row_start < _ne1 ? min(BN, _ne1 - row_start) : 0;
+    const uint route_base = expert_idx * p.nei0 * p.nei1 + row_start;
 
-    uint ids[16];
-    uint iter = 0;
-
-    uint expert_count = data_expert_count[expert_idx];
-
-    for (uint j = 0; j < num_elements; j += BLOCK_SIZE) {
-        // prefetch up to 16 elements
-        if (iter == 0) {
-            [[unroll]] for (uint k = 0; k < 16; ++k) {
-                uint i = j + gl_LocalInvocationIndex + k*BLOCK_SIZE;
-                bool in_range = i < num_elements;
-                uint ii1;
-                if (nei0_is_pow2) {
-                    ii1 = i >> nei0shift;
-                } else {
-                    ii1 = i / p.nei0;
-                }
-                uint ii0 = i - ii1 * p.nei0;
-                ids[k] = in_range ? data_ids[ii1*p.nbi1 + ii0] : 0;
-            }
-        }
-        uint i = j + gl_LocalInvocationIndex;
-        bool in_range = i < num_elements;
-        uint ii1;
-        if (nei0_is_pow2) {
-            ii1 = i >> nei0shift;
-        } else {
-            ii1 = i / p.nei0;
-        }
-        uint ii0 = i - ii1 * p.nei0;
-        uint id = ids[iter++];
-        uvec4 ballot = subgroupBallot(in_range && id == expert_idx);
-
-        if (gl_SubgroupInvocationID == 0) {
-            ballots_sh[gl_SubgroupID] = ballot;
-        }
-        barrier();
-
-        uint subgroup_base = 0;
-        uint total = 0;
-        for (uint k = 0; k < gl_NumSubgroups; ++k) {
-            if (k == gl_SubgroupID) {
-                subgroup_base = total;
-            }
-            total += subgroupBallotBitCount(ballots_sh[k]);
-        }
-        barrier();
-
-        uint idx = subgroup_base + subgroupBallotExclusiveBitCount(ballot);
-        if (in_range && id == expert_idx && _ne1 + idx >= ic * BN && _ne1 + idx < (ic + 1) * BN) {
-            row_ids[_ne1 + idx - ic * BN] = u16vec4(fastmod(ii0, p.ne11), ii1, ii0, 0);
-        }
-        _ne1 += total;
-        iter &= 15;
-        if (_ne1 >= (ic + 1) * BN || _ne1 == expert_count) {
-            break;
-        }
+    for (uint i = gl_LocalInvocationIndex; i < row_count; i += BLOCK_SIZE) {
+        const u16vec2 route = data_route[route_base + i];
+        row_ids[i] = u16vec4(fastmod(route.x, p.ne11), route.y, route.x, 0);
     }
     barrier();
 }
@@ -251,7 +205,11 @@ void main() {
     const uint ic = gl_WorkGroupID.y;
 
 #ifdef MUL_MAT_ID
+#ifdef B390_ROUTE_INDIRECT
+    const uint expert_idx = data_active_experts[1 + gl_WorkGroupID.z];
+#else
     const uint expert_idx = gl_WorkGroupID.z;
+#endif
     if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }
@@ -285,6 +243,9 @@ void main() {
     const uint ik = gl_WorkGroupID.x / blocks_m;
 
 #ifdef MUL_MAT_ID
+#if defined(B390_TUNED)
+    load_row_ids(expert_idx, ic);
+#else
     if (p.hoist_row_ids != 0) {
         load_row_ids_hoisted(expert_idx, ic);
     } else if (bitCount(p.nei0) == 1) {
@@ -292,6 +253,7 @@ void main() {
     } else {
         load_row_ids(expert_idx, false, ic);
     }
+#endif
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;

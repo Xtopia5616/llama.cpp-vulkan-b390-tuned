@@ -330,7 +330,11 @@ int llama_completion(int argc, char ** argv) {
             // remove any "future" tokens that we might have inherited from the previous session
             if (session_tokens.size() > n_match) {
                 llama_pos pos = n_match > 0 ? (llama_pos)(n_match - 1) : 0;
-                if (!llama_memory_seq_rm(mem, -1, pos, -1)) {
+                // Completion uses a single sequence.  Passing -1 here used to
+                // mean "all sequences", but current memory backends reject it
+                // when n_seq_max == 1, which disables otherwise valid session
+                // prefix reuse as soon as the cache contains generated tokens.
+                if (!llama_memory_seq_rm(mem, 0, pos, -1)) {
                     LOG_WRN("%s: unable to reuse common prefix (for example, when the memory is recurrent)\n", __func__);
                     llama_memory_clear(mem, true);
                     session_tokens.clear();

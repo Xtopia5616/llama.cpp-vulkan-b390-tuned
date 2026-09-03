@@ -249,6 +249,36 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
+#if defined(B390_Q4_BITFIELD_DEQUANT)
+            // PR24407: decode the 12 packed scale bytes as three words. On
+            // the fixed B390 Q4_K GEMM path this removes scattered byte
+            // reads and the selector-dependent ternary chain. `is < 4` is
+            // uniform for the aligned loads generated for this workload.
+            const uint j   = is & 3u;
+            const int jsh  = int(j * 8u);
+            const uint sw0 = data_a_packed32[ib].scales[0];
+            const uint sw1 = data_a_packed32[ib].scales[1];
+            const uint sw2 = data_a_packed32[ib].scales[2];
+
+            uint sc, mbyte;
+            if (is < 4u) {
+                sc    = bitfieldExtract(sw0, jsh,     6);
+                mbyte = bitfieldExtract(sw1, jsh,     6);
+            } else {
+                sc    = bitfieldExtract(sw2, jsh,     4) | (bitfieldExtract(sw0, jsh + 6, 2) << 4u);
+                mbyte = bitfieldExtract(sw2, jsh + 4, 4) | (bitfieldExtract(sw1, jsh + 6, 2) << 4u);
+            }
+
+            const float d = loadd.x * float(sc);
+            const float m = -loadd.y * float(mbyte);
+
+            const uint qs_word = data_a_packed32[ib].qs[qsi / 4];
+            const int base = int(b * 4u);
+            const vec4 q = vec4(float(bitfieldExtract(qs_word, base,      4)),
+                                float(bitfieldExtract(qs_word, base + 8,  4)),
+                                float(bitfieldExtract(qs_word, base + 16, 4)),
+                                float(bitfieldExtract(qs_word, base + 24, 4)));
+#else
             const uvec3 scales = uvec3(data_a_packed32[ib].scales[0],
                                        data_a_packed32[ib].scales[1],
                                        data_a_packed32[ib].scales[2]);
@@ -268,6 +298,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const float m = -loadd.y * mbyte;
 
             const vec4 q = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
+#endif
 
             const uint k_pair = row * LOAD_VEC_A / 2;
             store_a(col, k_pair,     FLOAT_TYPEV2(fma(d, q.x, m), fma(d, q.y, m)));
@@ -286,6 +317,28 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
+#if defined(B390_Q5_BITFIELD_DEQUANT)
+            // Q5_K shares Q4_K's packed scale layout. Keep the high-nibble
+            // reconstruction below unchanged so this isolates only Q5 scale
+            // decoding from the baseline shader.
+            const uint j   = is & 3u;
+            const int jsh  = int(j * 8u);
+            const uint sw0 = data_a_packed32[ib].scales[0];
+            const uint sw1 = data_a_packed32[ib].scales[1];
+            const uint sw2 = data_a_packed32[ib].scales[2];
+
+            uint sc, mbyte;
+            if (is < 4u) {
+                sc    = bitfieldExtract(sw0, jsh,     6);
+                mbyte = bitfieldExtract(sw1, jsh,     6);
+            } else {
+                sc    = bitfieldExtract(sw2, jsh,     4) | (bitfieldExtract(sw0, jsh + 6, 2) << 4u);
+                mbyte = bitfieldExtract(sw2, jsh + 4, 4) | (bitfieldExtract(sw1, jsh + 6, 2) << 4u);
+            }
+
+            const float d = loadd.x * float(sc);
+            const float m = -loadd.y * float(mbyte);
+#else
             const uvec3 scales = uvec3(data_a_packed32[ib].scales[0],
                                        data_a_packed32[ib].scales[1],
                                        data_a_packed32[ib].scales[2]);
@@ -303,6 +356,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
+#endif
 
             const uint qs = (data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F;
             const uint qh = ((data_a_packed32[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;
@@ -461,6 +515,34 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #elif defined(DATA_A_IQ3_XXS)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
+#if LOAD_VEC_A == 8
+            const uint ib = idx / 32;            // 8 values per idx (2 IQ3 codes)
+            const uint iqs = 2 * (idx % 32);     // even code index, 0..62
+            const uint is = QUANT_K / 4 + 4 * (iqs / 8); // sign/scale group for 8 values
+
+            const float d = float(data_a[ib].d);
+            const uint qs0 = data_a[ib].qs[iqs];
+            const uint qs1 = data_a[ib].qs[iqs + 1];
+            const uint signs = pack32(u16vec2(
+                data_a_packed16[ib].qs[is/2],
+                data_a_packed16[ib].qs[is/2+1]
+            ));
+            const float db = d * 0.5 * (0.5 + (signs >> 28));
+            const uint sign7 = bitfieldExtract(signs, 7 * (int(iqs / 2) % 4), 7);
+            const uint sign = sign7 | (bitCount(sign7) << 7);
+            const vec4 v0 = db * vec4(unpack8(iq3xxs_grid[qs0]));
+            const vec4 v1 = db * vec4(unpack8(iq3xxs_grid[qs1]));
+
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair,     FLOAT_TYPEV2((sign &   1) != 0 ? -v0.x : v0.x,
+                                                   (sign &   2) != 0 ? -v0.y : v0.y));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2((sign &   4) != 0 ? -v0.z : v0.z,
+                                                   (sign &   8) != 0 ? -v0.w : v0.w));
+            store_a(col, k_pair + 2, FLOAT_TYPEV2((sign &  16) != 0 ? -v1.x : v1.x,
+                                                   (sign &  32) != 0 ? -v1.y : v1.y));
+            store_a(col, k_pair + 3, FLOAT_TYPEV2((sign &  64) != 0 ? -v1.z : v1.z,
+                                                   (sign & 128) != 0 ? -v1.w : v1.w));
+#else
             const uint ib = idx / 64;            // 4 values per idx
             const uint iqs = idx % 64;           // 0..63
             const uint is = QUANT_K / 4 + 4 * (iqs / 8); // 8 values
@@ -482,6 +564,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                                    (sign &   2) != 0 ? -v.y : v.y));
             store_a(col, k_pair + 1, FLOAT_TYPEV2((sign &   4) != 0 ? -v.z : v.z,
                                                    (sign &   8) != 0 ? -v.w : v.w));
+#endif
 #elif defined(DATA_A_IQ3_S)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 

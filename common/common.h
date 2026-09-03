@@ -450,6 +450,8 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    int32_t n_moe_cache_slots     = 0;    // GPU cache slots per host-resident MoE expert layer (0 = disabled)
+    int32_t n_moe_cache_inserts   = 2;    // max expert uploads per layer per decode step
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -629,6 +631,8 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool semantic_checkpoints   = false; // create semantic user/tool anchors in the server
+    bool semantic_checkpoints_on_device = false; // keep the newest semantic anchor on device
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
@@ -1163,6 +1167,10 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;
+
+    // A semantic checkpoint is anchored at a user/tool boundary rather than
+    // being created only to protect a speculative rollback.
+    bool semantic = false;
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;

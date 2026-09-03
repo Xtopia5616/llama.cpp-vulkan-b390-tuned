@@ -353,6 +353,8 @@ struct server_slot_stats {
     uint64_t n_prompt_cached    = 0;
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;
+    uint64_t n_checkpoint_hits  = 0;
+    uint64_t n_checkpoint_tokens = 0;
 
     // speculative decoding stats
     // note: the per-position breakdown lives in server_slot, it is not needed in a task result

@@ -34,8 +34,15 @@ layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #ifdef MUL_MAT_ID
+#if defined(B390_TUNED)
+layout (binding = 3) readonly buffer RouteRows {u16vec2 data_route[];};
+#else
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
+#endif
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+#ifdef B390_ROUTE_INDIRECT
+layout (binding = 5) readonly buffer ActiveExperts {uint data_active_experts[];};
+#endif
 #endif
 
 layout (push_constant) uniform parameter
@@ -58,6 +65,7 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint hoist_row_ids;
+    uint padded_N;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -112,7 +120,11 @@ void main() {
     const uint ic = gl_WorkGroupID.y;
 
 #ifdef MUL_MAT_ID
+#ifdef B390_ROUTE_INDIRECT
+    const uint expert_idx = data_active_experts[1 + gl_WorkGroupID.z];
+#else
     const uint expert_idx = gl_WorkGroupID.z;
+#endif
     if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }
@@ -159,6 +171,9 @@ void main() {
     const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
 
 #ifdef MUL_MAT_ID
+#if defined(B390_TUNED)
+    load_row_ids(expert_idx, ic);
+#else
     if (p.hoist_row_ids != 0) {
         load_row_ids_hoisted(expert_idx, ic);
     } else {
@@ -184,6 +199,7 @@ void main() {
         barrier();
 #endif
     }
+#endif
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;

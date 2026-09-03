@@ -12,8 +12,6 @@ void main() {
     // 8 threads handle 1 superblock
     const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
 
-    init_iq_shmem(gl_WorkGroupSize);
-
     if (ib >= p.nel / 256) {
         return;
     }

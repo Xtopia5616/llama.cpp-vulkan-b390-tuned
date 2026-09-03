@@ -258,6 +258,11 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // One hot semantic anchor may live in the context's device-resident state
+    // storage. Older anchors remain in prompt.checkpoints as host fallbacks.
+    common_prompt_checkpoint semantic_ckpt;
+    llama_tokens semantic_ckpt_tokens;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -337,6 +342,22 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        semantic_ckpt.clear();
+        semantic_ckpt_tokens.clear();
+    }
+
+    bool semantic_ckpt_matches(const server_tokens & tokens) const {
+        if (semantic_ckpt.empty() || semantic_ckpt_tokens.empty() || tokens.size() < semantic_ckpt_tokens.size()) {
+            return false;
+        }
+
+        for (size_t i = 0; i < semantic_ckpt_tokens.size(); ++i) {
+            if (tokens[i] != semantic_ckpt_tokens[i]) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -730,6 +751,8 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        other.semantic_ckpt.clear();
+        other.semantic_ckpt_tokens.clear();
         other.init_sampler();
     }
 };
@@ -2295,14 +2318,41 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(
+            server_slot & slot,
+            const int64_t n_tokens_cur,
+            llama_pos pos_min,
+            llama_pos pos_max,
+            bool semantic) {
         const int id_task = slot.task->id;
+
+        if (semantic && params_base.semantic_checkpoints_on_device && !slot.prompt.tokens.has_mtmd) {
+            auto & cur = slot.semantic_ckpt;
+
+            cur.clear();
+            cur.semantic = true;
+            cur.id_task = id_task;
+            cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+            auto prefix = slot.prompt.tokens.get_text_tokens();
+            const size_t n_prefix = std::min<size_t>(prefix.size(), std::max<int64_t>(0, cur.n_tokens));
+            prefix.resize(n_prefix);
+            slot.semantic_ckpt_tokens = std::move(prefix);
+
+            SLT_TRC(slot,
+                    "updated device semantic checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            return;
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (!it->semantic && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2327,6 +2377,7 @@ private:
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+        cur.semantic = semantic;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -2339,7 +2390,8 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                "created %s context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                semantic ? "semantic" : "rollback",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
@@ -3320,33 +3372,58 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                    bool do_reset = true;
+
+                                    // Prefer the newest device-resident semantic
+                                    // anchor when its token prefix still matches.
+                                    if (params_base.semantic_checkpoints_on_device &&
+                                        slot.semantic_ckpt_matches(input_tokens)) {
+                                        const auto & cur = slot.semantic_ckpt;
+                                        if (cur.pos_max <= pos_next && (cur.pos_min < pos_min_thold || cur.pos_min == 0)) {
+                                            cur.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                            cur.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                            common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
+
+                                            pos_next = std::min(pos_next, std::max(cur.pos_min + 1, cur.pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) cur.n_tokens);
+                                            slot.stats.n_checkpoint_hits++;
+                                            slot.stats.n_checkpoint_tokens += n_past;
+                                            do_reset = false;
+                                            SLT_TRC(slot, "restored device semantic checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_past);
                                         }
-                                    );
+                                    }
 
-                                    bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    if (do_reset) {
+                                        // search for a host context checkpoint
+                                        const auto it = std::find_if(
+                                            slot.prompt.checkpoints.rbegin(),
+                                            slot.prompt.checkpoints.rend(),
+                                            [&](const auto & cur) {
+                                                // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
+                                                SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                                // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
+                                                if (cur.pos_max > pos_next) {
+                                                    return false;
+                                                }
+                                                return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            }
+                                        );
 
-                                    if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        do_reset = it == slot.prompt.checkpoints.rend();
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        if (!do_reset) {
+                                            // restore the context checkpoint
+                                            it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            // restore the draft's speculative state
+                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            slot.stats.n_checkpoint_hits++;
+                                            slot.stats.n_checkpoint_tokens += n_past;
+                                            SLT_TRC(slot, "restored host context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        }
                                     }
 
                                     if (do_reset) {
@@ -3368,6 +3445,11 @@ private:
                                     } else {
                                         ++it;
                                     }
+                                }
+
+                                if (!slot.semantic_ckpt.empty() && slot.semantic_ckpt.pos_max > pos_next) {
+                                    slot.semantic_ckpt.clear();
+                                    slot.semantic_ckpt_tokens.clear();
                                 }
                             }
                         }
@@ -3430,7 +3512,8 @@ private:
                         alora_disabled_id = enabled_loras[0];
                     }
 
-                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+                    const bool semantic_checkpoints = params_base.semantic_checkpoints;
+                    bool do_checkpoint = params_base.n_ctx_checkpoints > 0 || semantic_checkpoints;
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -3441,6 +3524,7 @@ private:
                     // - the model uses SWA (and we are not using `swa_full`)
                     // - the model supports partial sequence removal but only up to a fixed bound
                     do_checkpoint = do_checkpoint && (
+                            (semantic_checkpoints && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) ||
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
@@ -3519,12 +3603,15 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // In semantic mode, stop exactly at user/tool boundaries so
+                        // the checkpoint represents the stable prefix before the
+                        // next editable message.
+                        const bool semantic_boundary = semantic_checkpoints && spans.is_semantic_start(slot.prompt.n_tokens());
+                        if (do_checkpoint && (semantic_boundary || spans.is_user_start(slot.prompt.n_tokens()))) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (semantic_boundary || pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -3559,6 +3646,7 @@ private:
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
+                    const bool is_semantic_boundary = semantic_checkpoints && spans.is_semantic_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
                     // entire prompt has been processed
@@ -3577,7 +3665,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !is_semantic_boundary && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -3596,6 +3684,7 @@ private:
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
+                            is_semantic_boundary ||
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
@@ -3604,7 +3693,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_semantic_boundary);
                     }
                 }
 

@@ -1,0 +1,54 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+// Build a compact list of experts with at least one routed row and write a
+// VkDispatchIndirectCommand for the following MUL_MAT_ID dispatch.  The
+// x/y dimensions remain host-selected because they depend on the selected
+// matmul pipeline; the z dimension is generated from device-side counts.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Counts { uint data_expert_count[]; };
+layout (binding = 1) buffer Control { uint data_control[]; };
+
+layout (push_constant) uniform parameter {
+    uint n_as;
+    uint workgroups_x;
+    uint workgroups_y;
+} p;
+
+shared uint active_count;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (tid == 0) {
+        active_count = 0;
+    }
+    barrier();
+
+    for (uint expert = tid; expert < p.n_as; expert += gl_WorkGroupSize.x) {
+        if (data_expert_count[expert] > 0) {
+            const uint active_idx = atomicAdd(active_count, 1);
+            // control[0] is active_count; control[1..n_as] is the
+            // compacted logical-expert list.
+            data_control[1 + active_idx] = expert;
+        }
+    }
+
+    // Make the storage writes to the list visible before tid 0 publishes the
+    // indirect command.  The host adds a compute->indirect/read barrier
+    // before executing that command.
+    memoryBarrierBuffer();
+    barrier();
+
+    if (tid == 0) {
+        data_control[0] = active_count;
+        const uint args = 1 + p.n_as;
+        data_control[args + 0] = p.workgroups_x;
+        data_control[args + 1] = p.workgroups_y;
+        data_control[args + 2] = active_count;
+    }
+}
