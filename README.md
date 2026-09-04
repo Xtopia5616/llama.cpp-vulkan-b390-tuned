@@ -19,11 +19,44 @@
 
 ## B390 tuned fork
 
-This fork publishes a clean `baseline` and the current `v1` B390 Vulkan tuning. See [B390-VULKAN-V1.md](B390-VULKAN-V1.md) for the complete optimization list, exact machine snapshot, public benchmark profile, rejected experiments, and upstream references.
+This fork publishes two named reference builds for the Intel Arc B390 Vulkan workload:
 
-`baseline` is the unmodified upstream snapshot. `v1` is a merge of the tuned tree with the complete upstream `master` through `c7bda030e`; this includes upstream changes such as PR #27483. The public comparison profile is `-ngl -1 -fa auto -b 2048 -ub 512 -t 16 -pg 128,64`; the document also records the separate tuning-window profile used during optimization.
+- `baseline`: the unmodified upstream snapshot at `46bdeb47d`.
+- `v1`: the B390-tuned tree merged with upstream `master` through `c7bda030e`.
 
-The exact Release/Vulkan CMake configuration and build command are recorded in [B390-VULKAN-V1.md](B390-VULKAN-V1.md).
+The benchmark model is `Qwen3.6-35B-A3B-DSV4Pro-SFT-GPT56Sol-RL-Agent-LynnStyle-Q3_16G-LynnStyle-imatrix.gguf` (Qwen3.6 35B-A3B IQ3_XXS, 3.0625 bpw).
+
+### What v1 optimizes
+
+The optimization has two parts:
+
+- **Runtime/build parameters:** GPU offload, Flash Attention mode, batch/ubatch sizes, CPU threads, KV-cache types, context depth, and B390-specific CMake switches select the tuned execution path.
+- **Source code and Vulkan shaders:** the backend, scheduler, MoE routing, state-update fusions, cooperative-matrix kernels, quantized mat-vec/GEMM paths, and Flash Attention shaders are changed for the B390 workload.
+
+- B390/Xe2 device gating, shape-aware Vulkan pipeline selection, and tuned cooperative-matrix tiles.
+- IQ3/IQ2/Q4_K/Q5_K quantized GEMM and mat-vec paths, including register-pressure and dequantization tuning.
+- Xe Flash Attention with specialized head-size kernels and split prefill/decode phases.
+- MoE route skipping, routed-row packing, expert compaction, and device-resident route/cache support.
+- FLOP-aware graph submission plus fused GDN and SSM state updates.
+
+All hardware-specific paths remain gated and retain generic Vulkan fallbacks. The optimization is aimed at the B390 + Qwen3.6 35B-A3B IQ3_XXS workload; it is not a claim about every Vulkan device.
+
+### Baseline vs v1
+
+The four-row comparison uses the exact model named above on the same machine, with official default runtime parameters: `-p 512 -n 128 -pg "512,64"`, either `-d 0` or `-d 15808`, `-b 2048 -ub 512 -t 16 -fa auto -ctk f16 -ctv f16 -ngl -1 -dev Vulkan0 -r 5`.
+
+| Build/profile | Context | Prefill `pp512` | Generation `tg128` | Combined `pp512+tg64` |
+| --- | --- | ---: | ---: | ---: |
+| Official baseline, default params | Empty `d=0` | `765.75 +/- 7.94 tok/s` | `34.21 +/- 0.16 tok/s` | `224.32 +/- 1.35 tok/s` |
+| Official baseline, default params | Full `d=15808` | `218.60 +/- 0.82 tok/s` | `24.72 +/- 0.13 tok/s` | `111.32 +/- 2.54 tok/s` |
+| Modified v1, default runtime params | Empty `d=0` | `871.55 +/- 19.47 tok/s` | `37.68 +/- 0.17 tok/s` | `240.19 +/- 5.07 tok/s` |
+| Modified v1, default runtime params | Full `d=15808` | `608.72 +/- 8.51 tok/s` | `30.00 +/- 0.73 tok/s` | `190.50 +/- 2.59 tok/s` |
+
+These are local directional measurements; the three metric columns are prefill-only, generation-only, and combined prompt-plus-generation throughput.
+
+The empty-context PP512 rows are the source of the commonly remembered 700-800 tok/s result and are not directly comparable with the full-context `d=15808` rows.
+
+See [B390-VULKAN-V1.md](B390-VULKAN-V1.md) for the detailed optimization inventory and build configuration. The standalone [performance results](docs/b390/results.md) and [reproduction operations](docs/b390/operations.md) are maintained separately.
 
 ## Quick start
 
